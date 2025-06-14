@@ -1,0 +1,261 @@
+name: Terraform DEV App pipeline
+
+on:
+  # Triggers the workflow on push request events to branch
+  push:
+    branches: 
+      - 'feature/*'
+      - 'main'
+
+    paths:
+      - 'dev/app/**' 
+   
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  ARM_CLIENT_ID: "${{ secrets.AZURE_CLIENT_ID }}"
+  ARM_TENANT_ID: "${{ secrets.AZURE_TENANT_ID }}"
+  ARM_SUBSCRIPTION_ID: "${{ secrets.AZURE_NON_PRD_SUBSCRIPTION_ID }}"
+  ARM_USE_AZUREAD: true
+  environment: 'dev'
+  workdir: 'app'
+
+jobs:
+## tflint
+  tflint-checks:
+    runs-on: ubuntu-latest
+    name: 'IaC Scanning > Tflint'    
+
+    steps:
+    - name : Check out Git Repository
+      uses: actions/checkout@v3  
+      
+    # TFLint - Terraform Check
+    - uses: actions/cache@v4
+      name: Cache plugin dir
+      with:
+        path: ~/.tflint.d/plugins
+        key: ${{ matrix.os }}-tflint-${{ hashFiles('.tflint.hcl') }}
+
+    - uses: terraform-linters/setup-tflint@v2
+      name: Setup TFLint
+      with:
+        tflint_version: latest
+        
+    # Print TFLint version
+    - name: Show version
+      run: tflint --version
+      
+    # Install plugins
+    - name: Init TFLint
+      run: tflint --init
+      
+    # Run tflint command in each directory recursively # use --force if you want to continue with workflow although errors are there
+    - name: Run TFLint
+      run: cd ${{ env.environment }}/${{ env.workdir }}; tflint -f compact --recursive --force
+
+  # Checkov
+  checkov:
+    name: 'IaC Scanning > Checkov'
+    runs-on: ubuntu-latest
+    needs: [tflint-checks]
+
+    defaults:
+      run:
+        working-directory: ${{ env.environment }}/${{ env.workdir }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run > Checkov scanning
+        id: checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ env.environment }}/${{ env.workdir }}
+          framework: terraform
+          soft_fail: true
+          output_format: cli,sarif
+          output_file_path: console,results.sarif
+          skip_check: CKV_TF_1,CKV_AZURE_220
+
+  ## Terratest
+  terratest:
+    name: 'IAC Scanning > Terratest'
+    # if: ${{ inputs.unittest == 'yes' }}
+    runs-on: ubuntu-latest    
+    needs: [checkov]
+    continue-on-error: true 
+    defaults:
+      run:
+        working-directory: ${{ env.environment }}/${{ env.workdir }}
+    
+    steps:
+      - uses: actions/checkout@v1
+
+      - name: Setup Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: 1.24
+
+      - name: Setup Terratest Dependencies
+        working-directory: ${{ env.environment }}/${{ env.workdir }}/tests
+        # run:  go get -v -t -d && go mod tidy
+        run:  go mod init ${{ env.workdir }}_test.go && go mod tidy
+
+      - name: 'Setup > Az CLI auth'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_NON_PRD_SUBSCRIPTION_ID }}
+          
+      - name: Install > terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_wrapper: false
+
+      - name: Retrieve secret from KV
+        uses: azure/cli@v2
+        id: get-secret
+        with:
+          inlineScript: |
+            az keyvault secret download --vault-name "kvsplgdevopsger01" --name "sshprivatekey" --file /tmp/id_rsa
+            export SSH_PRIVATE_KEY="$(cat /tmp/id_rsa)"
+            {
+              echo "SSH_PRIVATE_KEY<<EOF"
+              cat /tmp/id_rsa
+              echo "EOF"
+            } >> $GITHUB_ENV
+
+      - name: Configure SSH Key for GitHub
+        uses: shimataro/ssh-key-action@v2
+        with:
+          key: |
+            ${{ env.SSH_PRIVATE_KEY }}
+          name: id_rsa
+          known_hosts: github.com
+          if_key_exists: replace
+
+      - name: Verify SSH Connection
+        run: ssh -T git@github.com || true
+
+      - name: Execute Unit-test
+        working-directory: ${{ env.environment }}/${{ env.workdir }}/tests
+        run: go test -v
+
+  tf_plan:
+    name: 'Terraform > validate & plan'
+    runs-on: ubuntu-latest
+    needs: [terratest]
+
+    defaults:
+      run:
+        working-directory: ${{ env.environment }}/${{ env.workdir }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 'Setup > Az CLI auth'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_NON_PRD_SUBSCRIPTION_ID }}
+
+      - name: Install > terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Retrieve secret from KV
+        uses: azure/cli@v2
+        id: get-secret
+        with:
+          inlineScript: |
+            az keyvault secret download --vault-name "kvsplgdevopsger01" --name "sshprivatekey" --file /tmp/id_rsa
+            export SSH_PRIVATE_KEY="$(cat /tmp/id_rsa)"
+            {
+              echo "SSH_PRIVATE_KEY<<EOF"
+              cat /tmp/id_rsa
+              echo "EOF"
+            } >> $GITHUB_ENV
+
+      - name: Configure SSH Key for GitHub
+        uses: shimataro/ssh-key-action@v2
+        with:
+          key: |
+            ${{ env.SSH_PRIVATE_KEY }}
+          name: id_rsa
+          known_hosts: github.com
+          if_key_exists: replace
+
+      - name: Verify SSH Connection
+        run: ssh -T git@github.com || true
+
+      - name: Run > terraform init
+        run: terraform init
+
+      - name: Run > terraform validate
+        run: terraform validate
+
+      - name: Run > terraform plan
+        run: terraform plan -input=false
+
+  tf_apply:
+    name: 'Terraform > apply'
+    runs-on: ubuntu-latest
+    needs: [ tf_plan ]
+    if: ${{ github.ref == 'refs/heads/main' }} # skip deploy if not run main branch
+    defaults:
+      run:
+        working-directory: ${{ inputs.environment }}/${{ inputs.workdir }}    
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 'Setup > AZ CLI auth'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_NON_PRD_SUBSCRIPTION_ID }}
+
+      - name: Install > terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Retrieve secret from KV
+        uses: azure/cli@v2
+        id: get-secret
+        with:
+          inlineScript: |
+            az keyvault secret download --vault-name "kvsplgdevopsger01" --name "sshprivatekey" --file /tmp/id_rsa
+            export SSH_PRIVATE_KEY="$(cat /tmp/id_rsa)"
+            {
+              echo "SSH_PRIVATE_KEY<<EOF"
+              cat /tmp/id_rsa
+              echo "EOF"
+            } >> $GITHUB_ENV
+
+      - name: Configure SSH Key for GitHub
+        uses: shimataro/ssh-key-action@v2
+        with:
+          key: |
+            ${{ env.SSH_PRIVATE_KEY }}
+          name: id_rsa
+          known_hosts: github.com
+          if_key_exists: replace
+
+      # - name: Configure SSH Key for GitHub
+      #   uses: shimataro/ssh-key-action@v2
+      #   with:
+      #     key: ${{ secrets.SSH_PRIVATE_KEY }}
+      #     name: id_rsa
+      #     known_hosts: github.com
+      #     if_key_exists: replace
+
+      - name: Run > terraform init
+        run: terraform init
+
+      - name: Rollout > Terraform Apply
+        run: terraform apply -auto-approve -input=false
