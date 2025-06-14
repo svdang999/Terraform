@@ -1,0 +1,285 @@
+name: Terragrunt DEV self-hosted pipeline
+
+on:
+  # Triggers the workflow on push request events to branch
+  push:
+    branches: 
+      - 'feature/*'
+      - 'main'
+
+    paths:
+      - 'germanywestcentral/dev/**' 
+
+permissions:
+  id-token: write
+  contents: read
+  pages: write
+
+env:
+  ARM_CLIENT_ID: "${{ secrets.AZURE_CLIENT_ID }}"
+  ARM_TENANT_ID: "${{ secrets.AZURE_TENANT_ID }}"
+  ARM_SUBSCRIPTION_ID: "${{ secrets.AZURE_NON_PRD_SUBSCRIPTION_ID }}"
+  ARM_USE_AZUREAD: true
+  SHARED_MODULES_TF: "dbp-cloud-platform-sharedmodule-iac"
+  WORKING_DIR: "germanywestcentral/dev"
+
+  ##terragrunt
+  tg_version: '0.75.3' #https://github.com/gruntwork-io/terragrunt/releases
+
+jobs:  
+  ## tflint
+  tflint-checks:
+    runs-on: build-iac-nonprod
+    name: 'IaC Scanning > Tflint'
+    continue-on-error: true
+
+    steps:
+    - name : Check out Git Repository
+      uses: actions/checkout@v3      
+
+    - name: Checkout Git Repository SharedModules - Generate a Github's token
+      id: generate-token
+      uses: actions/create-github-app-token@v2
+      with:
+        app-id: ${{ secrets.APP_GITHUB_ID }}
+        private-key: ${{ secrets.APP_GITHUB_PRIVATE_KEY }}
+        owner: ${{ github.repository_owner }}
+        repositories: |
+          dbp-cloud-platform-sharedmodule-iac
+
+    - name : Checkout Git Repository SharedModules
+      uses: actions/checkout@v3     
+      with:
+        repository: SaudiPostLogisticsGroup/dbp-cloud-platform-sharedmodule-iac
+        token: ${{ steps.generate-token.outputs.token }}   
+        path: ${{ env.SHARED_MODULES_TF }} #${{ github.workspace }}/dbp-cloud-platform-sharedmodule-iac
+
+    # - name: move sharedmodule PATH
+    #   run: mv ${{ github.workspace }}/${{ env.SHARED_MODULES_TF }} ../${{ github.workspace }}/${{ env.SHARED_MODULES_TF }}
+
+    - name: Run > Check pre-requisited tools - self-hosted
+      id: check-tools-selfhost
+      run: |
+        echo "check current available tools..."
+        ls -lsrht ${{ github.workspace }}
+        terraform -v
+        az --version
+        go version
+        terragrunt -v
+        checkov -v
+        python3 --version
+
+        echo "start the ssh agent..."
+        eval $(ssh-agent -s)        
+
+        echo "connect to keyvault..."
+        az login --identity --object-id 153acae2-4042-4d57-8656-78b57d1e47d7
+        az keyvault secret download --vault-name "kvsplgdevopsger01" --name "sshprivatekey" --file /tmp/id_rsa        
+        chmod 400 /tmp/id_rsa  
+        ssh-add /tmp/id_rsa      
+      
+    #     echo "connect to github... ssh -T git@github.com || true"      
+
+    # TFLint - Terraform Check
+    - uses: actions/cache@v4
+      name: Cache plugin dir
+      with:
+        path: ~/.tflint.d/plugins
+        key: ${{ matrix.os }}-tflint-${{ hashFiles('.tflint.hcl') }}
+
+    - uses: terraform-linters/setup-tflint@v2
+      name: Setup TFLint
+      with:
+        tflint_version: latest
+        
+    # Print TFLint version
+    - name: Show version
+      run: tflint --version
+      
+    # Install plugins
+    - name: Init TFLint
+      run: tflint --init
+      
+    # Run tflint command in each directory recursively # use --force if you want to continue with workflow although errors are there
+    - name: Run TFLint
+      run: cd modules; tflint -f compact --recursive --force
+
+  # Checkov
+  iac_scanning:
+    name: 'IaC Scanning > Checkov'
+    runs-on: scan-iac-nonprod
+    needs: [tflint-checks]
+
+    defaults:
+      run:
+        working-directory: 'modules'    
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set PATH
+        run: echo "TG_PATH=${{ github.workspace }}" >> $GITHUB_ENV
+
+      - name: Run > Checkov scanning - self-hosted
+        id: check-tools-selfhost
+        run: |
+          unset https_proxy
+          checkov -d ${{ env.TG_PATH }}/modules --skip-check CKV_TF_1,CKV_AZURE_220 --soft-fail --output cli --output sarif --output-file-path console,results.sarif --framework terraform
+
+  # ## Terratest
+  terratest:
+    name: 'IAC Scanning - unit-test > Terratest'
+    runs-on: scan-iac-nonprod 
+    needs: [iac_scanning]    
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }} 
+    
+    steps:
+      - uses: actions/checkout@v1
+
+      - name: Checkout Git Repository SharedModules - Generate a Github's token
+        id: generate-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_GITHUB_ID }}
+          private-key: ${{ secrets.APP_GITHUB_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            dbp-cloud-platform-sharedmodule-iac
+
+      - name : Checkout Git Repository SharedModules
+        uses: actions/checkout@v3     
+        with:
+          repository: SaudiPostLogisticsGroup/dbp-cloud-platform-sharedmodule-iac
+          token: ${{ steps.generate-token.outputs.token }}   
+          path: ${{ env.SHARED_MODULES_TF }} #${{ github.workspace }}/dbp-cloud-platform-sharedmodule-iac
+
+      # - name: move sharedmodule PATH
+      #   run: mv ${{ github.workspace }}/${{ env.SHARED_MODULES_TF }} ../${{ github.workspace }}/${{ env.SHARED_MODULES_TF }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: 1.24
+     
+
+      # - name: Setup Dependencies
+      #   working-directory: tests/all/
+      #   # run:  go get -v -t -d && go mod tidy
+      #   run:  go mod init dev_test.go && go mod tidy
+
+      - name: Execute Unit-test all
+        working-directory: tests/all/
+        run: |
+          go mod init dev_test.go && go mod tidy
+          go test dev_test.go -v
+
+  ## Plan
+  tg_plan_all:
+    name: 'Terragrunt > Plan'
+    runs-on: build-iac-nonprod 
+    if: always()
+    needs: [terratest]
+
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v1 
+
+      - name: Checkout Git Repository SharedModules - Generate a Github's token
+        id: generate-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_GITHUB_ID }}
+          private-key: ${{ secrets.APP_GITHUB_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            dbp-cloud-platform-sharedmodule-iac
+
+      - name : Checkout Git Repository SharedModules
+        uses: actions/checkout@v3     
+        with:
+          repository: SaudiPostLogisticsGroup/dbp-cloud-platform-sharedmodule-iac
+          token: ${{ steps.generate-token.outputs.token }}   
+          path: ${{ env.SHARED_MODULES_TF }} #${{ github.workspace }}/dbp-cloud-platform-sharedmodule-iac
+
+      # - name: move sharedmodule PATH
+      #   run: mv ${{ github.workspace }}/${{ env.SHARED_MODULES_TF }} ../${{ github.workspace }}/${{ env.SHARED_MODULES_TF }}
+
+      - name: Run > Terragrunt plan
+        run: terragrunt run-all plan
+
+  # ## Apply 
+  tg_apply:
+    name: 'Terragrunt > apply'
+    runs-on: deploy-iac-nonprod 
+    needs: [ tg_plan_all ]    
+    if: ${{ github.ref == 'refs/heads/main' && needs.tg_plan_all.result == 'success' && always() }} # skip deploy if not run on main branch
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}    
+    environment: 'dev'
+
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v1
+
+      - name: Checkout Git Repository SharedModules - Generate a Github's token
+        id: generate-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_GITHUB_ID }}
+          private-key: ${{ secrets.APP_GITHUB_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            dbp-cloud-platform-sharedmodule-iac
+
+      - name : Checkout Git Repository SharedModules
+        uses: actions/checkout@v3     
+        with:
+          repository: SaudiPostLogisticsGroup/dbp-cloud-platform-sharedmodule-iac
+          token: ${{ steps.generate-token.outputs.token }}   
+          path: ${{ env.SHARED_MODULES_TF }} #${{ github.workspace }}/dbp-cloud-platform-sharedmodule-iac
+
+      # - name: move sharedmodule PATH
+      #   run: mv ${{ github.workspace }}/${{ env.SHARED_MODULES_TF }} ../${{ github.workspace }}/${{ env.SHARED_MODULES_TF }}
+
+      - name: Run > Terragrunt Apply
+        run: terragrunt run-all apply --non-interactive
+
+  # # Notification
+  teams_notification:
+    name: 'MS Teams Notification'
+    runs-on: deploy-iac-nonprod 
+    needs: [terratest, tg_plan_all, tg_apply]
+    if : always()
+
+    steps:
+      - name: Set Color Based on Status
+        id: set-color
+        run: |
+          if [[ "${{ needs.terratest.result }}" == "success" && "${{ needs.tg_plan_all.result }}" == "success" && ("${{ needs.tg_apply.result }}" == "skipped" || "${{ needs.tg_apply.result }}" == "success") ]]; then
+            echo "color=28a745" >> $GITHUB_OUTPUT
+            STATUS="success"
+            echo "STATUS=${STATUS}" >> $GITHUB_ENV
+
+          else
+            echo "color=dc3545" >> $GITHUB_OUTPUT
+            STATUS="failed, please review failure step"
+            echo "STATUS=${STATUS}" >> $GITHUB_ENV 
+          fi
+
+      - name: Send Teams Notification
+        uses: jdcargile/ms-teams-notification@v1.3
+        with:
+          github-token: ${{ github.token }} # this will use the runner's token.
+          ms-teams-webhook-uri: ${{ secrets.MS_TEAMS_WEBHOOK_URI }}
+          notification-summary: |
+            Deployment Integration DEV ${{ env.STATUS }}.
+          notification-color: ${{ steps.set-color.outputs.color }}
+          timezone: "Asia/Ho_Chi_Minh"   
+
